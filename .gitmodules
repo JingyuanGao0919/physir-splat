@@ -1,0 +1,7 @@
+[submodule "submodules/simple-knn"]
+	path = submodules/simple-knn
+	url = https://gitlab.inria.fr/bkerbl/simple-knn.git
+[submodule "submodules/diff-gaussian-rasterization-extentions"]
+	path = submodules/diff-gaussian-rasterization-extentions
+	url = https://github.com/ingra14m/diff-gaussian-rasterization-extentions
+	branch = filter-norm
