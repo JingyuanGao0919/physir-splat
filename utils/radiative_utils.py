@@ -1,7 +1,7 @@
 import json
 import math
 import os
-from typing import Dict
+from typing import Dict, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -367,6 +367,209 @@ def fit_rt_attributes(q_target: torch.Tensor, opt, device, lut: PlanckLUT) -> Di
     }
 
 
+def _robust_normalize_features(x: torch.Tensor) -> torch.Tensor:
+    x = x.detach().float()
+    center = x.median(dim=0).values
+    scale = torch.quantile((x - center).abs(), 0.95, dim=0).clamp_min(1e-6)
+    return ((x - center) / scale).clamp(-2.0, 2.0)
+
+
+def _material_features(gaussians, extracted, opt) -> torch.Tensor:
+    device = gaussians.get_xyz.device
+    try:
+        rgb_dc = torch.clamp(SH2RGB(gaussians._features_dc[:, 0, :].detach()), 0.0, 1.0)
+    except Exception:
+        rgb_dc = extracted["rgb_dc"].detach().to(device).clamp(0.0, 1.0)
+
+    xyz_feat = _robust_normalize_features(gaussians.get_xyz.detach())
+    rest_ratio = _robust_normalize_features(extracted["rest_ratio"].detach().to(device))
+    rgb_weight = float(getattr(opt, "phys_decouple_rgb_feature_weight", 1.0))
+    xyz_weight = float(getattr(opt, "phys_decouple_xyz_feature_weight", 0.15))
+    rest_weight = float(getattr(opt, "phys_decouple_rest_feature_weight", 0.05))
+    return torch.cat((rgb_weight * rgb_dc, xyz_weight * xyz_feat, rest_weight * rest_ratio), dim=1)
+
+
+def _assign_kmeans(features: torch.Tensor, num_clusters: int, sample_count: int, iters: int,
+                   chunk_size: int = 65536) -> torch.Tensor:
+    device = features.device
+    n = features.shape[0]
+    k = max(1, min(int(num_clusters), n))
+    if k == 1:
+        return torch.zeros(n, dtype=torch.long, device=device)
+
+    sample_count = max(k, min(int(sample_count), n))
+    sample_idx = torch.randperm(n, device=device)[:sample_count]
+    sample = features[sample_idx]
+    init_idx = torch.randperm(sample_count, device=device)[:k]
+    centroids = sample[init_idx].clone()
+
+    for _ in range(max(int(iters), 1)):
+        sample_labels = []
+        for start in range(0, sample_count, chunk_size):
+            chunk = sample[start:start + chunk_size]
+            sample_labels.append(torch.cdist(chunk, centroids).argmin(dim=1))
+        labels = torch.cat(sample_labels, dim=0)
+        new_centroids = torch.zeros_like(centroids)
+        counts = torch.bincount(labels, minlength=k).float().clamp_min(1.0).to(device)
+        new_centroids.index_add_(0, labels, sample)
+        new_centroids = new_centroids / counts[:, None]
+        empty = counts <= 1.0
+        if empty.any():
+            refill = torch.randperm(sample_count, device=device)[:int(empty.sum().item())]
+            new_centroids[empty] = sample[refill]
+        centroids = new_centroids
+
+    all_labels = []
+    for start in range(0, n, chunk_size):
+        chunk = features[start:start + chunk_size]
+        all_labels.append(torch.cdist(chunk, centroids).argmin(dim=1))
+    return torch.cat(all_labels, dim=0)
+
+
+def _local_smooth_pairs(xyz: torch.Tensor, sample_count: int, device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    n = xyz.shape[0]
+    if n < 2 or sample_count <= 1:
+        empty_i = torch.empty(0, dtype=torch.long, device=device)
+        empty_w = torch.empty(0, dtype=torch.float32, device=device)
+        return empty_i, empty_i, empty_w
+
+    sample_count = min(int(sample_count), n)
+    sample_idx = torch.randperm(n, device=device)[:sample_count]
+    sample_xyz = _robust_normalize_features(xyz[sample_idx].detach())
+
+    pair_i = []
+    pair_j = []
+    projections = [
+        sample_xyz[:, 0],
+        sample_xyz[:, 1],
+        sample_xyz[:, 2],
+        sample_xyz @ torch.tensor([0.37, 0.53, 0.76], dtype=sample_xyz.dtype, device=device),
+        sample_xyz @ torch.tensor([0.71, -0.22, 0.41], dtype=sample_xyz.dtype, device=device),
+    ]
+    for projection in projections:
+        order = torch.argsort(projection)
+        pair_i.append(sample_idx[order[:-1]])
+        pair_j.append(sample_idx[order[1:]])
+
+    pair_i = torch.cat(pair_i, dim=0)
+    pair_j = torch.cat(pair_j, dim=0)
+    pair_delta = xyz[pair_i].detach() - xyz[pair_j].detach()
+    dist = torch.norm(pair_delta, dim=1)
+    sigma = torch.quantile(dist, 0.50).clamp_min(1e-6)
+    weights = torch.exp(-(dist / sigma).square()).clamp_min(1e-3)
+    return pair_i, pair_j, weights
+
+
+def fit_material_decoupled_rt_attributes(extracted: Dict[str, torch.Tensor], gaussians, opt, device,
+                                         lut: PlanckLUT) -> Dict[str, torch.Tensor]:
+    """Fit single-band RT attributes with 3DGS material and geometry priors.
+
+    Single-band thermal data cannot uniquely identify both temperature and
+    emissivity. This diagnostic fit constrains emissivity as a material-cluster
+    attribute and temperature as a locally smooth spatial field.
+    """
+    q = torch.clamp(extracted["q_target"].detach().reshape(-1), 1e-4, 1.0 - 1e-4)
+    n = q.numel()
+    if n == 0:
+        return fit_rt_attributes(extracted["q_target"], opt, device, lut)
+
+    features = _material_features(gaussians, extracted, opt)
+    num_clusters = int(getattr(opt, "phys_decouple_clusters", 16))
+    cluster_samples = int(getattr(opt, "phys_decouple_cluster_samples", 50000))
+    cluster_iters = int(getattr(opt, "phys_decouple_cluster_iters", 20))
+    material_ids = _assign_kmeans(features, num_clusters, cluster_samples, cluster_iters)
+    k = int(material_ids.max().item()) + 1
+
+    ambient_init = torch.quantile(q, opt.phys_probe_ambient_quantile).item()
+    ambient_init = max(min(ambient_init, 0.95), 1e-4)
+    e_frac = (opt.phys_probe_e_init - opt.phys_probe_e_min) / max(opt.phys_probe_e_max - opt.phys_probe_e_min, 1e-6)
+    e_frac = max(min(float(e_frac), 1.0 - 1e-4), 1e-4)
+
+    u_raw = torch.logit(q).detach().clone().requires_grad_(True)
+    e_raw = torch.full((k,), math.log(e_frac / (1.0 - e_frac)), device=device, dtype=torch.float32, requires_grad=True)
+    a_raw = torch.tensor(math.log(ambient_init / (1.0 - ambient_init)), device=device, dtype=torch.float32, requires_grad=True)
+    delta_raw = torch.zeros((n,), device=device, dtype=torch.float32, requires_grad=True)
+
+    smooth_samples = int(getattr(opt, "phys_decouple_smooth_samples", 60000))
+    pair_i, pair_j, pair_w = _local_smooth_pairs(gaussians.get_xyz.detach(), smooth_samples, device)
+
+    lr = float(getattr(opt, "phys_decouple_lr", opt.phys_probe_lr))
+    steps = int(getattr(opt, "phys_decouple_steps", opt.phys_probe_steps))
+    delta_max = float(getattr(opt, "phys_decouple_delta_max", opt.phys_probe_delta_max))
+    temp_smooth_weight = float(getattr(opt, "phys_decouple_lambda_temp_smooth", 0.05))
+    e_prior_weight = float(getattr(opt, "phys_decouple_lambda_e_prior", opt.phys_probe_lambda_e_prior))
+    a_prior_weight = float(getattr(opt, "phys_decouple_lambda_a_prior", opt.phys_probe_lambda_a_prior))
+    delta_weight = float(getattr(opt, "phys_decouple_lambda_delta", opt.phys_probe_lambda_delta))
+    optimizer = torch.optim.Adam([u_raw, e_raw, a_raw, delta_raw], lr=lr)
+
+    e_init = torch.full((k,), opt.phys_probe_e_init, device=device)
+    a_init = torch.tensor(ambient_init, device=device)
+    temp_span = max(float(opt.phys_probe_temp_max - opt.phys_probe_temp_min), 1e-6)
+
+    for _ in range(max(steps, 1)):
+        u = torch.sigmoid(u_raw)
+        e_cluster = opt.phys_probe_e_min + (opt.phys_probe_e_max - opt.phys_probe_e_min) * torch.sigmoid(e_raw)
+        e = e_cluster[material_ids]
+        a = torch.sigmoid(a_raw)
+        delta = delta_max * torch.tanh(delta_raw)
+        q_phys = e * u + (1.0 - e) * a + delta
+
+        fit = F.smooth_l1_loss(q_phys, q, beta=opt.phys_probe_huber_beta)
+        e_prior = F.smooth_l1_loss(e_cluster, e_init, beta=opt.phys_probe_huber_beta)
+        a_prior = F.smooth_l1_loss(a, a_init, beta=opt.phys_probe_huber_beta)
+        delta_reg = delta.abs().mean()
+
+        if pair_i.numel() > 0 and temp_smooth_weight > 0.0:
+            temp = lut.norm_radiance_to_temp(u)
+            temp_unit = (temp - float(opt.phys_probe_temp_min)) / temp_span
+            temp_diff = F.smooth_l1_loss(
+                temp_unit[pair_i],
+                temp_unit[pair_j],
+                beta=float(getattr(opt, "phys_decouple_temp_smooth_beta", 0.02)),
+                reduction="none",
+            )
+            temp_smooth = (pair_w * temp_diff).sum() / pair_w.sum().clamp_min(1e-6)
+        else:
+            temp_smooth = q.new_tensor(0.0)
+
+        loss = (
+            fit
+            + e_prior_weight * e_prior
+            + a_prior_weight * a_prior
+            + delta_weight * delta_reg
+            + temp_smooth_weight * temp_smooth
+        )
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+    with torch.no_grad():
+        u = torch.sigmoid(u_raw)
+        e_cluster = opt.phys_probe_e_min + (opt.phys_probe_e_max - opt.phys_probe_e_min) * torch.sigmoid(e_raw)
+        e = e_cluster[material_ids]
+        a = torch.sigmoid(a_raw)
+        delta = delta_max * torch.tanh(delta_raw)
+        q_phys = e * u + (1.0 - e) * a + delta
+        temp = lut.norm_radiance_to_temp(u)
+
+    cluster_counts = torch.bincount(material_ids, minlength=k).float()
+    return {
+        "emission": u[:, None],
+        "emissivity": e[:, None],
+        "ambient": torch.full((n, 1), float(a.detach().item()), device=device),
+        "delta": delta[:, None],
+        "q_phys": q_phys[:, None],
+        "temperature": temp[:, None],
+        "fit_abs_err": (q_phys - q).abs()[:, None],
+        "fit_sq_err": (q_phys - q).square()[:, None],
+        "ambient_init": torch.full((n, 1), ambient_init, device=device),
+        "material_ids": material_ids[:, None],
+        "cluster_emissivity": e_cluster[:, None],
+        "cluster_counts": cluster_counts[:, None],
+    }
+
+
 def _add_prefixed(summary: Dict[str, float], prefix: str, stats: Dict[str, float]) -> None:
     for key, value in stats.items():
         summary[f"{prefix}_{key}"] = value
@@ -474,6 +677,21 @@ def append_physir_summary(log_path: str, summary: Dict[str, float]) -> None:
         f.write(json.dumps(summary, ensure_ascii=False) + "\n")
 
 
+def _attach_material_fit_summary(summary: Dict[str, float], fit: Dict[str, torch.Tensor]) -> None:
+    summary["fit_method"] = "material_cluster_emissivity_temperature_smooth"
+    if "cluster_emissivity" not in fit:
+        return
+    e_cluster = fit["cluster_emissivity"]
+    counts = fit["cluster_counts"]
+    summary["material_cluster_count"] = float(e_cluster.shape[0])
+    summary["cluster_emissivity_min"] = e_cluster.min().item()
+    summary["cluster_emissivity_max"] = e_cluster.max().item()
+    summary["cluster_emissivity_mean"] = e_cluster.mean().item()
+    summary["cluster_emissivity_std"] = e_cluster.std(unbiased=False).item()
+    summary["cluster_count_min"] = counts.min().item()
+    summary["cluster_count_max"] = counts.max().item()
+
+
 def fit_and_log_physir_attributes(iteration: int, gaussians, scene, opt, model_path: str, prev_point_count: int):
     del scene
     device = gaussians.get_xyz.device
@@ -490,7 +708,7 @@ def fit_and_log_physir_attributes(iteration: int, gaussians, scene, opt, model_p
 
     extracted = extract_thermal_gaussian_target(gaussians)
     with torch.enable_grad():
-        fit = fit_rt_attributes(extracted["q_target"], opt, device, lut)
+        fit = fit_material_decoupled_rt_attributes(extracted, gaussians, opt, device, lut)
 
     gaussians.update_radiative_transfer_attributes(
         iteration=iteration,
@@ -506,14 +724,14 @@ def fit_and_log_physir_attributes(iteration: int, gaussians, scene, opt, model_p
     )
 
     summary = gather_rt_summary(iteration, prev_point_count, gaussians, extracted, fit, opt)
+    _attach_material_fit_summary(summary, fit)
     text = summary_to_text(iteration, summary)
-    print(text)
+    print(text + " | material fit")
     append_physir_summary(os.path.join(model_path, "phys_probe", "probe_log.jsonl"), summary)
     gaussians.save_radiative_transfer_attributes(os.path.join(model_path, "phys_probe", f"iteration_{iteration}", "phys_probe.pt"))
 
     result_file_path = os.path.join(model_path, "result.txt")
     with open(result_file_path, "a", encoding="utf-8") as result_file:
-        result_file.write(text + "\n")
+        result_file.write(text + " | material fit\n")
 
     return summary
-
