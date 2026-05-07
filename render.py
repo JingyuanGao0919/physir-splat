@@ -19,17 +19,59 @@ import torchvision
 from utils.general_utils import safe_state
 from utils.pose_utils import pose_spherical, render_wander_path
 from argparse import ArgumentParser
-from arguments import ModelParams, PipelineParams, get_combined_args
+from arguments import ModelParams, PipelineParams, OptimizationParams, get_combined_args
 from gaussian_renderer import GaussianModel
+from scene.thermal_correction_model import ThermalCorrectionModel
+from train import compute_geo_fields, render_and_save_physical_fields
 import imageio
 import numpy as np
 import time
 
 
+def _is_temporal_thermal_render(gaussians, view=None):
+    return bool(
+        getattr(gaussians, "has_temporal_thermal_branch", False)
+        and (view is None or getattr(view, "is_temporal_thermal", False))
+    )
+
+
+def _temporal_override_color(gaussians, view=None, fid=None):
+    if not _is_temporal_thermal_render(gaussians, view):
+        return None
+    return gaussians.temporal_thermal_color(view, fid=fid)
+
+
+def _use_static_temporal_geometry(gaussians, view=None, temporal_use_view_deform=True):
+    return _is_temporal_thermal_render(gaussians, view) and not bool(temporal_use_view_deform)
+
+
+def _temporal_tcm_weight(opt, iteration=None):
+    if opt is None:
+        return 0.0
+    target = max(float(getattr(opt, "temporal_tcm_weight", 0.0)), 0.0)
+    if iteration is None or target <= 0.0:
+        return target
+    start_iter = max(int(getattr(opt, "temporal_tcm_start_iter", 0)), 0)
+    if int(iteration) < start_iter:
+        return 0.0
+    ramp_iters = max(int(getattr(opt, "temporal_tcm_ramp_iters", 0)), 0)
+    if ramp_iters <= 0:
+        return target
+    progress = min(max((int(iteration) - start_iter + 1) / float(ramp_iters), 0.0), 1.0)
+    return target * progress
+
+
+def _apply_temporal_tcm(image, temporal_tcm_model, opt, iteration=None):
+    weight = _temporal_tcm_weight(opt, iteration)
+    if temporal_tcm_model is None or weight <= 0.0:
+        return image
+    return torch.clamp(image + weight * temporal_tcm_model.step(image), 0.0, 1.0)
+
 
 
 def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background,
-               geo_model, device, rgb_geo_model=None):
+               geo_model, device, rgb_geo_model=None, temporal_use_view_deform=True, temporal_tcm_model=None,
+               opt=None):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
     render_rgb_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders_rgb")
@@ -44,37 +86,35 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
     makedirs(depth_path, exist_ok=True)
 
     t_list = []
+    time_interval = 1.0 / max(len(views), 1)
+    no_eval_noise = lambda _: 0.0
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         if load2gpu_on_the_fly:
             view.load2device()
         fid = view.fid
-        R = view.R
-        T = view.T
-
-        # Prepare camera transformation
-        R_torch = torch.from_numpy(R).float().to(device)
-        T_torch = torch.from_numpy(T).float().to(device)
-        Rt = torch.eye(4, device=device)
-        Rt[:3, :3] = R_torch.t()  # Transpose for world-to-camera to camera-to-world
-        Rt[:3, 3] = T_torch
-
-        c2w = Rt
-        cam_pos = c2w[:3, 3]
-        view_dir = -c2w[:3, 2]  # Assuming -Z is forward
-
-        # Expand inputs for all Gaussians
         xyz = gaussians.get_xyz
-        N = xyz.shape[0]
-
-        time_input = fid.unsqueeze(0).expand(N, -1)
-        view_dir = view_dir.unsqueeze(0).expand(N, -1)
-        cam_pos = view.camera_center.unsqueeze(0).expand(N, -1)
-
-        d_xyz, d_rotation, d_scaling = geo_model.step(gaussians.get_xyz.detach(), time_input, cam_pos, view_dir)
+        is_rgbt = getattr(view, "is_rgbt", False)
+        if _use_static_temporal_geometry(gaussians, view, temporal_use_view_deform):
+            d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
+        else:
+            d_xyz, d_rotation, d_scaling = compute_geo_fields(
+                view,
+                gaussians,
+                geo_model,
+                pipeline,
+                background,
+                opt,
+                iteration,
+                no_eval_noise,
+                time_interval,
+                device,
+                is_blender=True,
+                feature_set="thermal" if is_rgbt else "rgb",
+                eval_mode=True,
+            )
 
         t_start = time.time()
-        is_rgbt = getattr(view, "is_rgbt", False)
         results = render(
             view,
             gaussians,
@@ -85,10 +125,13 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
             d_scaling,
             device,
             is_6dof,
+            override_color=_temporal_override_color(gaussians, view),
             feature_set="thermal" if is_rgbt else "rgb",
         )
         t_end = time.time()
         rendering = results["render"]
+        if _is_temporal_thermal_render(gaussians, view):
+            rendering = _apply_temporal_tcm(rendering, temporal_tcm_model, opt)
         depth = results["depth"]
         depth = depth / (depth.max() + 1e-5)  # Normalize depth for visualization
 
@@ -99,8 +142,20 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
         torchvision.utils.save_image(depth, os.path.join(depth_path, f'{idx:05d}.png'))
         if is_rgbt and view.original_rgb_image is not None:
             rgb_geo = rgb_geo_model if rgb_geo_model is not None else geo_model
-            rgb_d_xyz, rgb_d_rotation, rgb_d_scaling = rgb_geo.step(
-                gaussians.get_xyz.detach(), time_input, cam_pos, view_dir
+            rgb_d_xyz, rgb_d_rotation, rgb_d_scaling = compute_geo_fields(
+                view,
+                gaussians,
+                rgb_geo,
+                pipeline,
+                background,
+                opt,
+                iteration,
+                no_eval_noise,
+                time_interval,
+                device,
+                is_blender=True,
+                feature_set="rgb",
+                eval_mode=True,
             )
             rgb_rendering = render(
                 view,
@@ -126,7 +181,8 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
     print(f'Test FPS: \033[1;35m{fps:.5f}\033[0m, Num. of GS: {xyz.shape[0]}')
 
 
-def interpolate_time(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, geo_model, device):
+def interpolate_time(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, geo_model, device,
+                     temporal_use_view_deform=True):
     render_path = os.path.join(model_path, name, "interpolate_{}".format(iteration), "renders")
     depth_path = os.path.join(model_path, name, "interpolate_{}".format(iteration), "depth")
 
@@ -142,27 +198,33 @@ def interpolate_time(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, 
     for t in tqdm(range(0, frame, 1), desc="Rendering progress"):
         fid = torch.Tensor([t / (frame - 1)]).to(device)
         
-        # Calculate view-dependent terms (same as render_set)
-        R = view.R
-        T = view.T
-        R_torch = torch.from_numpy(R).float().to(device)
-        T_torch = torch.from_numpy(T).float().to(device)
-        Rt = torch.eye(4, device=device)
-        Rt[:3, :3] = R_torch.t()
-        Rt[:3, 3] = T_torch
-        
-        c2w = Rt
-        cam_pos = c2w[:3, 3]
-        view_dir = -c2w[:3, 2]
-        
-        xyz = gaussians.get_xyz
-        N = xyz.shape[0]
-        time_input = fid.unsqueeze(0).expand(N, -1)
-        view_dir = view_dir.unsqueeze(0).expand(N, -1)
-        cam_pos = view.camera_center.unsqueeze(0).expand(N, -1)
-        
-        d_xyz, d_rotation, d_scaling = geo_model.step(xyz.detach(), time_input, cam_pos, view_dir)
-        results = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, device, is_6dof)
+        if _use_static_temporal_geometry(gaussians, view, temporal_use_view_deform):
+            d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
+        else:
+            # Calculate view-dependent terms (same as render_set)
+            R = view.R
+            T = view.T
+            R_torch = torch.from_numpy(R).float().to(device)
+            T_torch = torch.from_numpy(T).float().to(device)
+            Rt = torch.eye(4, device=device)
+            Rt[:3, :3] = R_torch.t()
+            Rt[:3, 3] = T_torch
+
+            c2w = Rt
+            cam_pos = c2w[:3, 3]
+            view_dir = -c2w[:3, 2]
+
+            xyz = gaussians.get_xyz
+            N = xyz.shape[0]
+            time_input = fid.unsqueeze(0).expand(N, -1)
+            view_dir = view_dir.unsqueeze(0).expand(N, -1)
+            cam_pos = view.camera_center.unsqueeze(0).expand(N, -1)
+
+            d_xyz, d_rotation, d_scaling = geo_model.step(xyz.detach(), time_input, cam_pos, view_dir)
+        results = render(
+            view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, device, is_6dof,
+            override_color=_temporal_override_color(gaussians, view, fid=fid),
+        )
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
         depth = results["depth"]
@@ -223,7 +285,10 @@ def interpolate_view(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, 
         cam_pos = view.camera_center.unsqueeze(0).expand(N, -1)
         
         d_xyz, d_rotation, d_scaling = geo_model.step(xyz.detach(), time_input, cam_pos, view_dir)
-        results = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, device, is_6dof)
+        results = render(
+            view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, device, is_6dof,
+            override_color=_temporal_override_color(gaussians, view, fid=fid),
+        )
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
         depth = results["depth"]
@@ -281,7 +346,10 @@ def interpolate_all(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, v
         cam_pos = view.camera_center.unsqueeze(0).expand(N, -1)
         
         d_xyz, d_rotation, d_scaling = geo_model.step(xyz.detach(), time_input, cam_pos, view_dir)
-        results = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, device, is_6dof)
+        results = render(
+            view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, device, is_6dof,
+            override_color=_temporal_override_color(gaussians, view, fid=fid),
+        )
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
         depth = results["depth"]
@@ -344,7 +412,10 @@ def interpolate_poses(model_path, load2gpt_on_the_fly, is_6dof, name, iteration,
         
         d_xyz, d_rotation, d_scaling = geo_model.step(xyz.detach(), time_input, cam_pos, view_dir)
 
-        results = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, device, is_6dof)
+        results = render(
+            view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, device, is_6dof,
+            override_color=_temporal_override_color(gaussians, view, fid=fid),
+        )
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
         depth = results["depth"]
@@ -415,7 +486,10 @@ def interpolate_view_original(model_path, load2gpt_on_the_fly, is_6dof, name, it
         
         d_xyz, d_rotation, d_scaling = geo_model.step(xyz.detach(), time_input, cam_pos, view_dir)
 
-        results = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, device, is_6dof)
+        results = render(
+            view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, device, is_6dof,
+            override_color=_temporal_override_color(gaussians, view, fid=fid),
+        )
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
         depth = results["depth"]
@@ -426,7 +500,7 @@ def interpolate_view_original(model_path, load2gpt_on_the_fly, is_6dof, name, it
 
 
 def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, skip_train: bool, skip_test: bool,
-                mode: str, device):
+                mode: str, device, opt=None):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree, device)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
@@ -436,9 +510,35 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         if getattr(scene, "has_rgbt", False):
             rgb_geo_model = GeoRefineModel(device, dataset.is_blender, dataset.is_6dof)
             rgb_geo_model.load_weights(dataset.model_path, subdir="GeometryRGB")
+        temporal_use_view_deform = bool(getattr(dataset, "temporal_use_view_deform", False))
+        temporal_tcm_model = None
+        if getattr(scene, "has_temporal_thermal", False) and _temporal_tcm_weight(opt) > 0.0:
+            candidate_tcm = ThermalCorrectionModel(
+                device, max_residual=float(getattr(opt, "temporal_tcm_max_residual", 0.1))
+            )
+            if candidate_tcm.load_weights(dataset.model_path, iteration=scene.loaded_iter if scene.loaded_iter else -1):
+                temporal_tcm_model = candidate_tcm
+                print("Loaded TemporalTCM correction for temporal thermal rendering.")
+            else:
+                print("TemporalTCM weights not found; rendering temporal thermal branch without correction.")
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device=device)
+
+        if mode == "physical_fields":
+            render_and_save_physical_fields(
+                scene,
+                gaussians,
+                geo_model,
+                pipeline,
+                dataset.model_path,
+                opt,
+                scene.loaded_iter,
+                device,
+                dataset.is_6dof,
+                dataset.load2gpu_on_the_fly,
+            )
+            return
 
         if mode == "render":
             render_func = render_set
@@ -457,7 +557,9 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
             if mode == "render":
                 render_func(dataset.model_path, dataset.load2gpu_on_the_fly, dataset.is_6dof, "train", scene.loaded_iter,
                             scene.getTrainCameras(), gaussians, pipeline,
-                            background, geo_model, device, rgb_geo_model=rgb_geo_model)
+                            background, geo_model, device, rgb_geo_model=rgb_geo_model,
+                            temporal_use_view_deform=temporal_use_view_deform,
+                            temporal_tcm_model=temporal_tcm_model, opt=opt)
             else:
                 render_func(dataset.model_path, dataset.load2gpu_on_the_fly, dataset.is_6dof, "train", scene.loaded_iter,
                             scene.getTrainCameras(), gaussians, pipeline,
@@ -467,7 +569,9 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
             if mode == "render":
                 render_func(dataset.model_path, dataset.load2gpu_on_the_fly, dataset.is_6dof, "test", scene.loaded_iter,
                             scene.getTestCameras(), gaussians, pipeline,
-                            background, geo_model, device, rgb_geo_model=rgb_geo_model)
+                            background, geo_model, device, rgb_geo_model=rgb_geo_model,
+                            temporal_use_view_deform=temporal_use_view_deform,
+                            temporal_tcm_model=temporal_tcm_model, opt=opt)
             else:
                 render_func(dataset.model_path, dataset.load2gpu_on_the_fly, dataset.is_6dof, "test", scene.loaded_iter,
                             scene.getTestCameras(), gaussians, pipeline,
@@ -482,15 +586,25 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Testing script parameters")
     model = ModelParams(parser, device, sentinel=True)
     pipeline = PipelineParams(parser)
+    optimization = OptimizationParams(parser, sentinel=True)
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--skip_train", default=True, action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--mode", default='render', choices=['render', 'time', 'view', 'all', 'pose', 'original'])
+    parser.add_argument("--mode", default='render', choices=['render', 'time', 'view', 'all', 'pose', 'original', 'physical_fields'])
     args = get_combined_args(parser, device)
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet, device)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, args.mode, device)
+    render_sets(
+        model.extract(args),
+        args.iteration,
+        pipeline.extract(args),
+        args.skip_train,
+        args.skip_test,
+        args.mode,
+        device,
+        optimization.extract(args),
+    )
