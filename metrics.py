@@ -11,6 +11,7 @@
 
 from pathlib import Path
 import os
+import shutil
 from PIL import Image
 import torch
 import torchvision.transforms.functional as tf
@@ -36,7 +37,7 @@ def readImages(renders_dir, gt_dir):
     return renders, gts, image_names
 
 
-def evaluate(model_paths):
+def evaluate(model_paths, keep_all_methods=False):
     full_dict = {}
     per_view_dict = {}
     full_dict_polytopeonly = {}
@@ -52,14 +53,16 @@ def evaluate(model_paths):
             per_view_dict_polytopeonly[scene_dir] = {}
 
             test_dir = Path(scene_dir) / "test"
+            scene_full = {}
+            scene_per_view = {}
 
-            for method in os.listdir(test_dir):
+            for method in sorted(os.listdir(test_dir)):
                 if not method.startswith("ours"):
                     continue
                 print("Method:", method)
 
-                full_dict[scene_dir][method] = {}
-                per_view_dict[scene_dir][method] = {}
+                scene_full[method] = {}
+                scene_per_view[method] = {}
                 full_dict_polytopeonly[scene_dir][method] = {}
                 per_view_dict_polytopeonly[scene_dir][method] = {}
 
@@ -82,13 +85,35 @@ def evaluate(model_paths):
                 print("  LPIPS: {:>12.7f}".format(torch.tensor(lpipss).mean(), ".5"))
                 print("")
 
-                full_dict[scene_dir][method].update({"SSIM": torch.tensor(ssims).mean().item(),
-                                                     "PSNR": torch.tensor(psnrs).mean().item(),
-                                                     "LPIPS": torch.tensor(lpipss).mean().item()})
-                per_view_dict[scene_dir][method].update(
+                scene_full[method].update({"SSIM": torch.tensor(ssims).mean().item(),
+                                           "PSNR": torch.tensor(psnrs).mean().item(),
+                                           "LPIPS": torch.tensor(lpipss).mean().item()})
+                scene_per_view[method].update(
                     {"SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
                      "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
                      "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)}})
+
+            if scene_full and not keep_all_methods:
+                best_method = max(scene_full, key=lambda name: scene_full[name]["PSNR"])
+                removed = []
+                for method in scene_full:
+                    if method != best_method:
+                        method_path = test_dir / method
+                        if method_path.is_dir():
+                            shutil.rmtree(method_path)
+                            removed.append(method)
+                print(
+                    "[METRICS_BEST] keeping only method {} with PSNR {:.7f}; removed={}".format(
+                        best_method,
+                        scene_full[best_method]["PSNR"],
+                        len(removed),
+                    )
+                )
+                full_dict[scene_dir] = {best_method: scene_full[best_method]}
+                per_view_dict[scene_dir] = {best_method: scene_per_view[best_method]}
+            else:
+                full_dict[scene_dir] = scene_full
+                per_view_dict[scene_dir] = scene_per_view
 
             with open(scene_dir + "/results.json", 'w') as fp:
                 json.dump(full_dict[scene_dir], fp, indent=True)
@@ -106,5 +131,6 @@ if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument('--model_paths', '-m', required=True, nargs="+", type=str, default=[])
+    parser.add_argument('--keep_all_methods', action="store_true")
     args = parser.parse_args()
-    evaluate(args.model_paths)
+    evaluate(args.model_paths, keep_all_methods=args.keep_all_methods)

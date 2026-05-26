@@ -13,9 +13,11 @@ import os
 import random
 import json
 from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import sceneLoadTypeCallbacks
+from scene.dataset_readers import readColmapSceneInfo, sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from scene.geometry_model import GeoRefineModel
+from scene.appearance_model import TemporalAffineModel
+from scene.pose_model import TemporalPoseModel
 from scene.atmospheric_model import AtmosModel
 from scene.planck_model import PlanckModel
 from scene.radiometric_model import RadiometricModel
@@ -32,12 +34,13 @@ class Scene:
         :param path: Path to colmap scene main folder.
         """
         self.model_path = args.model_path
+        self.load_model_path = getattr(args, "load_model_path", "") or self.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
 
         if load_iteration:
             if load_iteration == -1:
-                self.loaded_iter = searchForMaxIteration(os.path.join(self.model_path, "point_cloud"))
+                self.loaded_iter = searchForMaxIteration(os.path.join(self.load_model_path, "point_cloud"))
             else:
                 self.loaded_iter = load_iteration
             print("Loading trained model at iteration {}".format(self.loaded_iter))
@@ -63,7 +66,12 @@ class Scene:
         elif os.path.exists(os.path.join(args.source_path, "sparse")):
             if data_branch == "ir":
                 print("Using IR-only scene branch.")
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
+            scene_info = readColmapSceneInfo(
+                args.source_path,
+                args.images,
+                args.eval,
+                load_sparse_depth=bool(getattr(args, "load_sparse_depth", False)),
+            )
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
@@ -113,7 +121,7 @@ class Scene:
                                                                            args)
 
         if self.loaded_iter:
-            point_cloud_dir = os.path.join(self.model_path,
+            point_cloud_dir = os.path.join(self.load_model_path,
                                            "point_cloud",
                                            "iteration_" + str(self.loaded_iter))
             self.gaussians.load_ply(os.path.join(point_cloud_dir,

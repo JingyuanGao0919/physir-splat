@@ -85,6 +85,8 @@ class Camera(nn.Module):
             self.original_rgb_image = self.original_rgb_image.to(data_device)
         if self.original_physical_image is not None:
             self.original_physical_image = self.original_physical_image.to(data_device)
+        if self.depth is not None:
+            self.depth = self.depth.to(data_device)
         self.world_view_transform = self.world_view_transform.to(data_device)
         self.projection_matrix = self.projection_matrix.to(data_device)
         self.full_proj_transform = self.full_proj_transform.to(data_device)

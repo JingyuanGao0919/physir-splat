@@ -21,6 +21,61 @@ def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
 
 
+def image_gradient_xy(img):
+    grad_x = img[..., :, 1:] - img[..., :, :-1]
+    grad_y = img[..., 1:, :] - img[..., :-1, :]
+    return grad_x, grad_y
+
+
+def gradient_l1_loss(network_output, gt):
+    pred_x, pred_y = image_gradient_xy(network_output)
+    gt_x, gt_y = image_gradient_xy(gt)
+    return torch.abs(pred_x - gt_x).mean() + torch.abs(pred_y - gt_y).mean()
+
+
+def image_gradient_mean(img):
+    grad_x, grad_y = image_gradient_xy(img)
+    return 0.5 * (torch.abs(grad_x).mean() + torch.abs(grad_y).mean())
+
+
+def residual_robust_l1_loss(network_output, gt, beta=0.03, min_weight=0.25):
+    abs_diff = torch.abs(network_output - gt)
+    residual = abs_diff.detach().mean(dim=0, keepdim=True)
+    weight = beta / (residual + beta)
+    weight = weight.clamp(min=float(min_weight), max=1.0)
+    normalized_weight = weight / weight.mean().clamp_min(1e-6)
+    loss = (abs_diff * normalized_weight).mean()
+    low_weight_fraction = (weight <= float(min_weight) + 1e-6).float().mean()
+    return loss, weight.mean(), low_weight_fraction
+
+
+def trimmed_residual_loss(network_output, gt, quantile=0.85, mode="rmse", eps=1e-8, smooth_window=3):
+    abs_diff = torch.abs(network_output - gt)
+    residual = abs_diff.detach().mean(dim=0, keepdim=True)
+    q = min(max(float(quantile), 0.05), 0.99)
+    threshold = torch.quantile(residual.reshape(-1).float(), q).to(residual.dtype)
+    inlier = (residual <= threshold).float().unsqueeze(0)
+    window_size = int(smooth_window)
+    if window_size > 1:
+        if window_size % 2 == 0:
+            window_size += 1
+        neighbor_mean = F.avg_pool2d(
+            inlier,
+            kernel_size=window_size,
+            stride=1,
+            padding=window_size // 2,
+        )
+        inlier = torch.clamp(inlier + (neighbor_mean > 0.5).float(), 0.0, 1.0)
+    inlier = inlier.squeeze(0)
+    denom = (inlier.sum() * abs_diff.shape[0]).clamp_min(1.0)
+    if str(mode).lower() in ("l1", "mae"):
+        loss = (abs_diff * inlier).sum() / denom
+    else:
+        loss = torch.sqrt(((network_output - gt).pow(2) * inlier).sum() / denom + eps)
+    keep_fraction = inlier.mean()
+    return loss, keep_fraction, threshold
+
+
 def find_corners(img):
     inputs = img.unsqueeze(0)*255
     device = img.device

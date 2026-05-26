@@ -61,13 +61,25 @@ class Embedder:
 
 
 class GeoRefineNet(nn.Module):
-    def __init__(self, device, D=8, W=256, input_ch=3, output_ch=59, multires=10, is_blender=False, is_6dof=False):
+    def __init__(
+        self,
+        device,
+        D=8,
+        W=256,
+        input_ch=3,
+        output_ch=59,
+        multires=10,
+        time_multires=None,
+        is_blender=False,
+        is_6dof=False,
+    ):
         super(GeoRefineNet, self).__init__()
         self.D = D
         self.W = W
         self.input_ch = input_ch
         self.output_ch = output_ch
-        self.t_multires = 6 if is_blender else 10
+        default_time_multires = 6 if is_blender else 10
+        self.t_multires = default_time_multires if time_multires is None else time_multires
         self.skips = [D // 2]
 
         self.embed_time_fn, time_input_ch = get_embedder(self.t_multires, 1)
@@ -95,7 +107,20 @@ class GeoRefineNet(nn.Module):
             self.gaussian_warp = nn.Linear(W, 3)
         self.gaussian_rotation = nn.Linear(W, 4)
         self.gaussian_scaling = nn.Linear(W, 3)
+        self._init_residual_heads()
         self.h_values = []
+
+    def _init_residual_heads(self):
+        # Geometry refinement is a residual field; start from identity so warmup
+        # does not inject random motion into static scenes.
+        heads = [self.gaussian_rotation, self.gaussian_scaling]
+        if self.is_6dof:
+            heads.extend([self.branch_w, self.branch_v])
+        else:
+            heads.append(self.gaussian_warp)
+        for layer in heads:
+            nn.init.zeros_(layer.weight)
+            nn.init.zeros_(layer.bias)
 
 
     def forward(self, x, t, cam_pos=None, view_dir=None):

@@ -58,7 +58,10 @@ class ModelParams(ParamGroup):
         self.data_device = device
         self.eval = False
         self.data_branch = "auto"
+        self.load_iteration = 0
+        self.load_model_path = ""
         self.load2gpu_on_the_fly = False
+        self.load_sparse_depth = False
         self.is_blender = False
         self.is_6dof = False
         super().__init__(parser, "Loading Parameters", sentinel)
@@ -66,6 +69,8 @@ class ModelParams(ParamGroup):
     def extract(self, args):
         g = super().extract(args)
         g.source_path = os.path.abspath(g.source_path)
+        if getattr(g, "load_model_path", ""):
+            g.load_model_path = os.path.abspath(g.load_model_path)
         return g
 
 
@@ -78,7 +83,7 @@ class PipelineParams(ParamGroup):
 
 
 class OptimizationParams(ParamGroup):
-    def __init__(self, parser):
+    def __init__(self, parser, sentinel=False):
         self.iterations = 30000
         self.warm_up = 3_000
         # self.warm_up = 0
@@ -90,21 +95,128 @@ class OptimizationParams(ParamGroup):
         self.planck_lr_max_steps = 30_000
         self.radiometric_lr_max_steps = 30_000
         self.geometry_lr_max_steps = 30_000
+        self.geometry_time_multires = -1
+        self.geometry_conditioning = "view"
+        self.geometry_train_until_iter = 1_000_000
+        self.geometry_grad_clip_norm = 0.0
+        self.temporal_jitter_mode = "stack"
+        self.temporal_jitter_scale = 1.0
+        self.temporal_jitter_min_factor = 0.0
+        self.geometry_motion_reg_weight = 0.0
+        self.geometry_motion_reg_start_iter = 3000
+        self.geometry_motion_reg_ramp_iters = 1000
+        self.geometry_temporal_smooth_weight = 0.0
+        self.geometry_temporal_smooth_start_iter = 3000
+        self.geometry_temporal_smooth_ramp_iters = 1000
         self.feature_lr = 0.0025
         self.thermal_feature_lr = 0.0025
         self.rgbt_rgb_loss_weight = 0.5
         self.rgbt_rgb_feature_lr_mult = 1.0
         self.rgbt_rgb_detach_geometry = 0
+        self.rgbt_save_best_eval_checkpoint = True
         self.opacity_lr = 0.05
         self.scaling_lr = 0.001
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
+        self.ir_gradient_loss_weight = 0.0
+        self.ir_gradient_loss_start_iter = 500
+        self.ir_gradient_loss_ramp_iters = 2000
+        self.ir_robust_loss_weight = 0.0
+        self.ir_robust_loss_start_iter = 3000
+        self.ir_robust_loss_ramp_iters = 1000
+        self.ir_robust_loss_beta = 0.03
+        self.ir_robust_loss_min_weight = 0.25
+        self.ir_rmse_loss_weight = 0.0
+        self.ir_rmse_loss_start_iter = 1000
+        self.ir_rmse_loss_ramp_iters = 2000
+        self.ir_rmse_loss_eps = 1e-8
+        self.ir_multiscale_loss_weight = 0.0
+        self.ir_multiscale_loss_start_iter = 1000
+        self.ir_multiscale_loss_ramp_iters = 2000
+        self.ir_multiscale_loss_scales = "2,4"
+        self.ir_multiscale_loss_mode = "rmse"
+        self.ir_trimmed_loss_weight = 0.0
+        self.ir_trimmed_loss_start_iter = 20_000
+        self.ir_trimmed_loss_ramp_iters = 1000
+        self.ir_trimmed_loss_quantile = 0.85
+        self.ir_trimmed_loss_mode = "rmse"
+        self.ir_trimmed_loss_smooth_window = 3
+        self.ir_sparse_depth_weight = 0.0
+        self.ir_sparse_depth_start_iter = 500
+        self.ir_sparse_depth_ramp_iters = 1000
+        self.ir_sparse_depth_min_acc = 0.30
+        self.ir_sparse_depth_huber_beta = 0.02
+        self.ir_sparse_depth_use_acc_normalize = True
+        self.ir_sparse_depth_scale_factor = 4
+        self.ir_late_consistency_start_iter = 20_000
+        self.ir_late_consistency_weight = 0.2
+        self.ir_late_ssim_weight = 0.2
+        self.ir_eval_temporal_ensemble = False
+        self.ir_eval_temporal_ensemble_samples = 3
+        self.ir_eval_temporal_ensemble_radius = 0.5
+        self.ir_eval_opacity_threshold = 0.0
+        self.ir_temporal_affine = False
+        self.ir_temporal_affine_mode = "mlp"
+        self.ir_temporal_affine_start_iter = 1000
+        self.ir_temporal_affine_lr = 0.001
+        self.ir_temporal_affine_reg_weight = 0.01
+        self.ir_temporal_affine_max_scale = 0.20
+        self.ir_temporal_affine_max_bias = 0.08
+        self.ir_temporal_affine_hidden_dim = 32
+        self.ir_temporal_affine_num_freqs = 4
+        self.ir_temporal_affine_grid_size = 8
+        self.ir_temporal_affine_grid_tv_weight = 0.05
+        self.ir_temporal_affine_table_smooth_weight = 0.1
+        self.ir_temporal_affine_smooth_weight = 0.0
+        self.ir_temporal_affine_smooth_start_iter = 1000
+        self.ir_temporal_affine_smooth_ramp_iters = 1000
+        self.ir_temporal_pose = False
+        self.ir_temporal_pose_mode = "mlp"
+        self.ir_temporal_pose_start_iter = 1000
+        self.ir_temporal_pose_lr = 0.0005
+        self.ir_temporal_pose_reg_weight = 0.01
+        self.ir_temporal_pose_max_trans = 0.02
+        self.ir_temporal_pose_max_rot_deg = 1.0
+        self.ir_temporal_pose_table_smooth_weight = 0.1
+        self.rgbt_rgb_gradient_loss_weight = 0.0
+        self.diagnostic_log_every = 1000
+        self.densify_log_every = 1000
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
         self.densify_until_iter = 20_000
         self.densify_grad_threshold = 0.0007
+        self.use_dual_gradient_densification = False
+        self.densify_grad_abs_threshold = 0.0004
+        self.use_direction_aware_densification = False
+        self.direction_aware_split_abs = False
+        self.direction_aware_base = 0.8
+        self.direction_aware_scale = 25.0
+        self.direction_aware_power = 15.0
+        self.densify_max_points = 0
+        self.densify_max_growth = 0.0
+        self.densify_max_new_points = 0
+        self.densify_split_first = False
+        self.densify_budget_recycle_points = 0
+        self.densify_budget_recycle_start = 0.97
+        self.densify_budget_recycle_opacity = 0.25
+        self.densify_budget_recycle_grad_factor = 2.0
+        self.use_density_guided_clone = False
+        self.density_guided_clone_scale = 1.0
+        self.needle_perturb_interval = 0
+        self.needle_perturb_until_iter = 20000
+        self.needle_perturb_ratio_min = 0.8
+        self.needle_perturb_ratio_max = 0.999
+        self.densify_screen_weight_power = 0.0
+        self.densify_screen_weight_max = 64.0
+        self.densify_residual_weight_power = 0.0
+        self.densify_residual_weight_max = 4.0
+        self.densify_residual_weight_min = 0.25
+        self.densify_residual_weight_quantile = 0.75
+        self.densify_residual_weight_start_iter = 3000
+        self.densify_residual_weight_blur = 1
+        self.densify_residual_weight_split_only = False
         self.phys_probe_every = 1000
         self.phys_probe_steps = 128
         self.phys_probe_lr = 0.05
@@ -155,7 +267,7 @@ class OptimizationParams(ParamGroup):
         self.phys_aux_conf_mix = 0.5
         self.phys_aux_conf_min = 0.75
         self.phys_aux_conf_max = 1.25
-        super().__init__(parser, "Optimization Parameters")
+        super().__init__(parser, "Optimization Parameters", sentinel)
 
 
 def get_combined_args(parser: ArgumentParser, device):

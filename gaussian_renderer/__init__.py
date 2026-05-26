@@ -17,6 +17,15 @@ from utils.sh_utils import SH2RGB, eval_sh
 from utils.rigid_utils import from_homogenous, to_homogenous
 import math
 
+try:
+    from diff_gaussian_rasterization_depth_acc import (
+        GaussianRasterizationSettings as DepthAccRasterizationSettings,
+        GaussianRasterizer as DepthAccRasterizer,
+    )
+except ImportError:
+    DepthAccRasterizationSettings = None
+    DepthAccRasterizer = None
+
 
 def quaternion_multiply(q1, q2):
     w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
@@ -32,7 +41,8 @@ def quaternion_multiply(q1, q2):
 
 def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_xyz, d_rotation, d_scaling, device, is_6dof=False,
            scaling_modifier=1.0, override_color=None, scale_factor=1, radiative_color=None, radiative_blend=0.0,
-           physical_color=None, physical_blend=0.0, feature_set="rgb", detach_geometry=False):
+           physical_color=None, physical_blend=0.0, feature_set="rgb", detach_geometry=False,
+           opacity_threshold=0.0):
     """
     Render the scene.
 
@@ -84,6 +94,8 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
         d_xyz_render = d_xyz.detach() if detach_geometry and torch.is_tensor(d_xyz) else d_xyz
         means3D = base_xyz + d_xyz_render
     opacity = pc.get_opacity.detach() if detach_geometry else pc.get_opacity
+    if float(opacity_threshold) > 0.0:
+        opacity = torch.where(opacity >= float(opacity_threshold), opacity, torch.zeros_like(opacity))
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -158,3 +170,98 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
             "visibility_filter": radii > 0,
             "radii": radii,
             "depth": depth}
+
+
+def render_depth_acc(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
+                     d_xyz, d_rotation, d_scaling, device, is_6dof=False,
+                     scaling_modifier=1.0, feature_set="rgb", detach_geometry=False,
+                     scale_factor=1):
+    if DepthAccRasterizer is None:
+        raise RuntimeError(
+            "diff_gaussian_rasterization_depth_acc is not installed; "
+            "install the depth-acc rasterizer before enabling sparse depth loss."
+        )
+
+    screenspace_points = torch.zeros_like(
+        pc.get_xyz,
+        dtype=pc.get_xyz.dtype,
+        requires_grad=True,
+        device=device,
+    ) + 0
+    try:
+        screenspace_points.retain_grad()
+    except Exception:
+        pass
+
+    scale_factor = max(1, int(scale_factor))
+    scaled_height = max(1, viewpoint_camera.image_height // scale_factor)
+    scaled_width = max(1, viewpoint_camera.image_width // scale_factor)
+
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    raster_settings = DepthAccRasterizationSettings(
+        image_height=int(scaled_height),
+        image_width=int(scaled_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=pipe.debug,
+    )
+    rasterizer = DepthAccRasterizer(raster_settings=raster_settings)
+
+    base_xyz = pc.get_xyz.detach() if detach_geometry else pc.get_xyz
+    if is_6dof:
+        if torch.is_tensor(d_xyz) is False:
+            means3D = base_xyz
+        else:
+            d_xyz_render = d_xyz.detach() if detach_geometry else d_xyz
+            means3D = from_homogenous(
+                torch.bmm(d_xyz_render, to_homogenous(base_xyz).unsqueeze(-1)).squeeze(-1)
+            )
+    else:
+        d_xyz_render = d_xyz.detach() if detach_geometry and torch.is_tensor(d_xyz) else d_xyz
+        means3D = base_xyz + d_xyz_render
+
+    opacity = pc.get_opacity.detach() if detach_geometry else pc.get_opacity
+    if pipe.compute_cov3D_python:
+        cov3D_precomp = pc.get_covariance(scaling_modifier)
+        if detach_geometry:
+            cov3D_precomp = cov3D_precomp.detach()
+        scales = None
+        rotations = None
+    else:
+        d_scaling_render = d_scaling.detach() if detach_geometry and torch.is_tensor(d_scaling) else d_scaling
+        d_rotation_render = d_rotation.detach() if detach_geometry and torch.is_tensor(d_rotation) else d_rotation
+        scales = (pc.get_scaling.detach() if detach_geometry else pc.get_scaling) + d_scaling_render
+        rotations = (pc.get_rotation.detach() if detach_geometry else pc.get_rotation) + d_rotation_render
+        cov3D_precomp = None
+
+    colors_precomp = torch.zeros((pc.get_xyz.shape[0], 3), device=device, dtype=pc.get_xyz.dtype)
+    rendered_image, depth, acc, radii = rasterizer(
+        means3D=means3D,
+        means2D=screenspace_points,
+        colors_precomp=colors_precomp,
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=cov3D_precomp,
+    )
+    if depth.dim() == 2:
+        depth = depth.unsqueeze(0)
+    if acc.dim() == 2:
+        acc = acc.unsqueeze(0)
+
+    return {
+        "render": rendered_image,
+        "depth": depth,
+        "acc": acc,
+        "viewspace_points": screenspace_points,
+        "visibility_filter": radii > 0,
+        "radii": radii,
+    }

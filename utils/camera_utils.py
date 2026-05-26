@@ -14,6 +14,8 @@ import numpy as np
 from utils.general_utils import PILtoTorch, ArrayToTorch
 from utils.graphics_utils import fov2focal
 import json
+import torch
+import torch.nn.functional as F
 
 WARNED = False
 
@@ -65,12 +67,22 @@ def loadCam(args, id, cam_info, resolution_scale):
             physical_tensor = physical_tensor.repeat(3, 1, 1)
         physical_image = physical_tensor[:3, ...]
 
+    depth = None
+    if getattr(cam_info, "depth", None) is not None:
+        depth_tensor = torch.as_tensor(np.asarray(cam_info.depth), dtype=torch.float32).view(
+            1,
+            1,
+            int(cam_info.depth.shape[0]),
+            int(cam_info.depth.shape[1]),
+        )
+        depth = F.interpolate(depth_tensor, size=(resolution[1], resolution[0]), mode="nearest")[0, 0].numpy()
+
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY,
                   image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id,
                   data_device=args.data_device if not args.load2gpu_on_the_fly else 'cpu', fid=cam_info.fid,
-                  depth=cam_info.depth, rgb_image=rgb_image, physical_image=physical_image,
+                  depth=depth, rgb_image=rgb_image, physical_image=physical_image,
                   is_rgbt=getattr(cam_info, "is_rgbt", False))
 
 

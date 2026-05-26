@@ -15,7 +15,7 @@ from PIL import Image
 from typing import NamedTuple, Optional
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
-from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
+from utils.graphics_utils import getProjectionMatrix, getWorld2View2, focal2fov, fov2focal
 import numpy as np
 import json
 import imageio
@@ -104,10 +104,26 @@ def getNerfppNorm(cam_info):
     return {"translate": translate, "radius": radius}
 
 
-def _image_name_to_time(image_name: str, idx: int, num_frames: int) -> float:
+def _image_name_to_index(image_name: str):
     digits = re.findall(r"\d+", image_name)
-    if digits and num_frames > 1:
-        return min(max((int(digits[-1]) - 1) / float(num_frames - 1), 0.0), 1.0)
+    if digits:
+        return int(digits[-1])
+    return None
+
+
+def _frame_index_base(image_names) -> int:
+    numeric_ids = [_image_name_to_index(name) for name in image_names]
+    numeric_ids = [value for value in numeric_ids if value is not None]
+    if not numeric_ids:
+        return 0
+    return min(numeric_ids)
+
+
+def _image_name_to_time(image_name: str, idx: int, num_frames: int, frame_index_base: int = 0) -> float:
+    numeric_id = _image_name_to_index(image_name)
+    if numeric_id is not None and num_frames > 1:
+        frame_idx = numeric_id - int(frame_index_base)
+        return min(max(frame_idx / float(num_frames - 1), 0.0), 1.0)
     return idx / float(max(num_frames - 1, 1))
 
 
@@ -115,9 +131,78 @@ def _thermal_to_gray_rgb(image: Image.Image) -> Image.Image:
     return image.convert("L").convert("RGB")
 
 
+def _attach_sparse_depth(cam_infos, pcd):
+    if pcd is None or pcd.points is None or len(pcd.points) == 0:
+        print("[SPARSE_DEPTH] point cloud unavailable; sparse depth supervision disabled.")
+        return cam_infos
+
+    points = np.asarray(pcd.points, dtype=np.float32)
+    updated = []
+    valid_counts = []
+    for cam in cam_infos:
+        points_h = np.concatenate([points, np.ones((points.shape[0], 1), dtype=np.float32)], axis=1)
+        world_view = getWorld2View2(cam.R, cam.T).transpose()
+        projection = getProjectionMatrix(
+            znear=0.01,
+            zfar=100.0,
+            fovX=cam.FovX,
+            fovY=cam.FovY,
+        ).transpose(0, 1).numpy()
+        full_proj = world_view @ projection
+        view_xyz = points_h @ world_view
+        clip_xyz = points_h @ full_proj
+        clip_w = clip_xyz[:, 3:4]
+        ndc = clip_xyz[:, :3] / np.maximum(np.abs(clip_w), 1e-7)
+        z = view_xyz[:, 2]
+        u = (ndc[:, 0] + 1.0) * 0.5 * cam.width
+        v = (ndc[:, 1] + 1.0) * 0.5 * cam.height
+        valid = (
+            (clip_w[:, 0] > 1e-7)
+            & (z > 1e-6)
+            & (ndc[:, 0] >= -1.0)
+            & (ndc[:, 0] <= 1.0)
+            & (ndc[:, 1] >= -1.0)
+            & (ndc[:, 1] <= 1.0)
+            & (u >= 0.0)
+            & (u <= cam.width - 1)
+            & (v >= 0.0)
+            & (v <= cam.height - 1)
+        )
+
+        depth = np.zeros((cam.height, cam.width), dtype=np.float32)
+        if np.any(valid):
+            x = np.rint(u[valid]).astype(np.int32).clip(0, cam.width - 1)
+            y = np.rint(v[valid]).astype(np.int32).clip(0, cam.height - 1)
+            z_valid = z[valid].astype(np.float32)
+            flat = y * cam.width + x
+            order = np.argsort(z_valid)
+            flat_sorted = flat[order]
+            z_sorted = z_valid[order]
+            first = np.ones_like(flat_sorted, dtype=bool)
+            first[1:] = flat_sorted[1:] != flat_sorted[:-1]
+            depth.reshape(-1)[flat_sorted[first]] = z_sorted[first]
+        valid_counts.append(int((depth > 0.0).sum()))
+        updated.append(cam._replace(depth=depth))
+
+    if valid_counts:
+        print(
+            "[SPARSE_DEPTH] projected COLMAP points: cams={} mean_valid={:.1f} "
+            "median_valid={:.1f} min_valid={} max_valid={}".format(
+                len(valid_counts),
+                float(np.mean(valid_counts)),
+                float(np.median(valid_counts)),
+                int(np.min(valid_counts)),
+                int(np.max(valid_counts)),
+            )
+        )
+    return updated
+
+
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     cam_infos = []
     num_frames = len(cam_extrinsics)
+    frame_index_base = _frame_index_base([os.path.splitext(os.path.basename(cam_extrinsics[key].name))[0]
+                                          for key in cam_extrinsics])
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
         # the exact output you're looking for:
@@ -150,7 +235,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
 
-        fid = _image_name_to_time(image_name, idx, num_frames)
+        fid = _image_name_to_time(image_name, idx, num_frames, frame_index_base)
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height, fid=fid)
         cam_infos.append(cam_info)
@@ -161,6 +246,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 def readRGBTCameras(cam_extrinsics, cam_intrinsics, rgb_folder, thermal_folder):
     cam_infos = []
     num_frames = len(cam_extrinsics)
+    frame_index_base = _frame_index_base([os.path.splitext(os.path.basename(cam_extrinsics[key].name))[0]
+                                          for key in cam_extrinsics])
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
         sys.stdout.write("Reading RGBT camera {}/{}".format(idx + 1, len(cam_extrinsics)))
@@ -197,7 +284,7 @@ def readRGBTCameras(cam_extrinsics, cam_intrinsics, rgb_folder, thermal_folder):
         thermal_image = Image.open(thermal_path).convert("RGB")
         physical_image = _thermal_to_gray_rgb(thermal_image)
         image_name = Path(basename).stem
-        fid = _image_name_to_time(image_name, idx, num_frames)
+        fid = _image_name_to_time(image_name, idx, num_frames, frame_index_base)
 
         cam_info = CameraInfo(
             uid=uid,
@@ -250,7 +337,7 @@ def storePly(path, xyz, rgb):
     ply_data.write(path)
 
 
-def readColmapSceneInfo(path, images, eval, llffhold=8):
+def readColmapSceneInfo(path, images, eval, llffhold=8, load_sparse_depth=False):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -294,6 +381,15 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         pcd = fetchPly(ply_path)
     except:
         pcd = None
+
+    if load_sparse_depth:
+        cam_infos = _attach_sparse_depth(cam_infos, pcd)
+        if eval:
+            train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+            test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+        else:
+            train_cam_infos = cam_infos
+            test_cam_infos = []
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,

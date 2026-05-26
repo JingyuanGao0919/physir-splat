@@ -62,6 +62,14 @@ RGB+thermal:
 python train.py -s path/to/your/RGBT-Scenes/scene_name --eval
 ```
 
+For RGBT training, the code keeps a mirrored copy of the best evaluated
+thermal checkpoint as `iteration_30001`. This is used only by the RGBT branch;
+TI-NSD IR-only training keeps its existing behavior.
+
+During training, validation PSNR/L1 is computed on save-image-compatible
+8-bit tensors. This matches `metrics.py` on rendered PNGs and is used only for
+logging/checkpoint selection; it does not enter the optimization loss.
+
 Select a data branch explicitly:
 
 ```shell
@@ -77,6 +85,31 @@ The default schedule trains for 30k iterations.
 
 ```shell
 python render.py -m output/exp-name
+python metrics.py -m output/exp-name
+```
+
+By default, `render.py` also renders the training views and runs the
+train-cross-validated temporal residual postprocess used for the reported
+TI-NSD numbers. It compares the raw render and the postprocessed render, then
+keeps only the better test method under `output/exp-name/test`.
+
+For RGBT models, `render.py` first looks for the mirrored best thermal
+checkpoint `iteration_30001` and uses it when present, then applies the same
+automatic postprocess. If an older RGBT model does not have that mirrored
+checkpoint, rendering falls back to the latest saved checkpoint.
+
+`metrics.py` follows the same convention: by default it keeps only the best
+PSNR method directory and writes only that method to `results.json` and
+`per_view.json`.
+
+This best-only behavior applies to both TI-NSD IR-only and RGBT rendering. It
+is applied after rendering and never changes the training loss or the rendered
+best PSNR itself.
+
+To render only the raw model output, disable the automatic postprocess:
+
+```shell
+python render.py -m output/exp-name --skip_temporal_residual_postprocess
 python metrics.py -m output/exp-name
 ```
 

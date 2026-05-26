@@ -8,8 +8,13 @@ from utils.general_utils import get_expon_lr_func
 
 
 class GeoRefineModel:
-    def __init__(self, device, is_blender=False, is_6dof=False):
-        self.geometry = GeoRefineNet(device, is_blender=is_blender, is_6dof=is_6dof).to(device)
+    def __init__(self, device, is_blender=False, is_6dof=False, time_multires=None):
+        self.geometry = GeoRefineNet(
+            device,
+            is_blender=is_blender,
+            is_6dof=is_6dof,
+            time_multires=time_multires,
+        ).to(device)
         self.optimizer = None
         self.spatial_lr_scale = 5
 

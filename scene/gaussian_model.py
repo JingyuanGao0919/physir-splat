@@ -44,6 +44,8 @@ class GaussianModel:
         self._opacity = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
+        self.xyz_gradient_accum_abs = torch.empty(0)
+        self.og_number_points = 0
 
         # Diagnostic-only physical quantities. They are fitted by the physics
         # probe and are not part of rendering or the main optimizer.
@@ -191,6 +193,7 @@ class GaussianModel:
         features[:, 3:, 1:] = 0.0
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+        self.og_number_points = int(fused_point_cloud.shape[0])
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().to(device)), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
@@ -215,6 +218,7 @@ class GaussianModel:
     def training_setup(self, training_args, device):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=device)
+        self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device=device)
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=device)
 
         self.spatial_lr_scale = 5
@@ -454,6 +458,7 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device=device).requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device=device).requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device=device).requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=device)
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -505,6 +510,7 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+        self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
@@ -559,10 +565,29 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=device)
+        self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device=device)
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=device)
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=device)
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, device, N=2):
+    def _cap_selected_mask(self, selected_pts_mask, scores, max_selected):
+        if max_selected is None:
+            return selected_pts_mask, 0
+        selected_count = int(selected_pts_mask.sum().item())
+        max_selected = int(max_selected)
+        if max_selected <= 0:
+            return torch.zeros_like(selected_pts_mask), selected_count
+        if selected_count <= max_selected:
+            return selected_pts_mask, 0
+        selected_idx = torch.where(selected_pts_mask)[0]
+        selected_scores = scores[selected_idx].detach().reshape(-1)
+        selected_scores[~torch.isfinite(selected_scores)] = 0.0
+        keep = torch.topk(selected_scores, k=int(max_selected), largest=True).indices
+        capped_mask = torch.zeros_like(selected_pts_mask)
+        capped_mask[selected_idx[keep]] = True
+        return capped_mask, selected_count - int(max_selected)
+
+    def densify_and_split(self, grads, grad_threshold, scene_extent, device, N=2,
+                          max_new_points=0, max_total_points=0):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device=device)
@@ -571,6 +596,22 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling,
                                                         dim=1).values > self.percent_dense * scene_extent)
+        candidate_count = int(selected_pts_mask.sum().item())
+        max_selected = candidate_count
+        if max_new_points and max_new_points > 0:
+            max_selected = min(max_selected, int(max_new_points) // max(int(N), 1))
+        if max_total_points and max_total_points > 0:
+            net_per_selected = max(int(N) - 1, 1)
+            remaining = max(int(max_total_points) - int(self.get_xyz.shape[0]), 0)
+            max_selected = min(max_selected, remaining // net_per_selected)
+        selected_pts_mask, clipped_count = self._cap_selected_mask(selected_pts_mask, padded_grad, max_selected)
+        selected_count = int(selected_pts_mask.sum().item())
+        if selected_count == 0:
+            return {
+                "candidates": candidate_count,
+                "selected": 0,
+                "clipped": clipped_count,
+            }
 
         stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
         means = torch.zeros((stds.size(0), 3), device=device)
@@ -591,15 +632,45 @@ class GaussianModel:
         prune_filter = torch.cat(
             (selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device=device, dtype=bool)))
         self.prune_points(prune_filter)
+        return {
+            "candidates": candidate_count,
+            "selected": selected_count,
+            "clipped": clipped_count,
+        }
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent, device):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, device,
+                          density_guided_clone=False, density_guided_clone_scale=1.0,
+                          max_new_points=0, max_total_points=0):
         # Extract points that satisfy the gradient condition
-        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        grad_norm = torch.norm(grads, dim=-1)
+        selected_pts_mask = torch.where(grad_norm >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling,
                                                         dim=1).values <= self.percent_dense * scene_extent)
+        candidate_count = int(selected_pts_mask.sum().item())
+        max_selected = candidate_count
+        if max_new_points and max_new_points > 0:
+            max_selected = min(max_selected, int(max_new_points))
+        if max_total_points and max_total_points > 0:
+            remaining = max(int(max_total_points) - int(self.get_xyz.shape[0]), 0)
+            max_selected = min(max_selected, remaining)
+        selected_pts_mask, clipped_count = self._cap_selected_mask(selected_pts_mask, grad_norm, max_selected)
+        selected_count = int(selected_pts_mask.sum().item())
+        if selected_count == 0:
+            return {
+                "candidates": candidate_count,
+                "selected": 0,
+                "clipped": clipped_count,
+            }
 
-        new_xyz = self._xyz[selected_pts_mask]
+        if density_guided_clone and selected_pts_mask.any():
+            # ReAct-GS style density-guided clone: place cloned small Gaussians
+            # near their local point spacing instead of exactly duplicating xyz.
+            dist2 = torch.clamp_min(distCUDA2(self._xyz.detach()), 0.0000001)
+            stds = torch.sqrt(dist2)[..., None].repeat(1, 3) * float(density_guided_clone_scale)
+            new_xyz = torch.normal(mean=self._xyz[selected_pts_mask], std=stds[selected_pts_mask])
+        else:
+            new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
         new_thermal_features_dc = self._thermal_features_dc[selected_pts_mask] if self.has_thermal_branch else None
@@ -631,27 +702,355 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
                                    new_rotation, device, new_thermal_features_dc, new_thermal_features_rest)
+        return {
+            "candidates": candidate_count,
+            "selected": selected_count,
+            "clipped": clipped_count,
+        }
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, device):
+    def needle_shape_perturbance(self, device, ratio_min=0.8, ratio_max=0.999):
+        original_scales = self.get_scaling
+        if original_scales.numel() == 0:
+            return {"selected": 0, "ratio_mean": 0.0, "ratio_p99": 0.0}
+
+        max_scales, max_idx = torch.max(original_scales, dim=1)
+        min_scales, _ = torch.min(original_scales, dim=1)
+        denom = (torch.sum(original_scales, dim=1) - max_scales - min_scales).clamp_min(1e-8)
+        needle_degree = max_scales / denom
+        needle_ratio = max_scales / torch.sum(original_scales, dim=1).clamp_min(1e-8)
+        selected_mask = torch.logical_and(needle_ratio > float(ratio_min), needle_ratio < float(ratio_max))
+        selected_idx = torch.where(selected_mask)[0]
+
+        ratio_values = needle_ratio.detach()
+        stats = {
+            "selected": int(selected_idx.numel()),
+            "ratio_mean": float(ratio_values.mean().item()),
+            "ratio_p99": float(torch.quantile(ratio_values, 0.99).item()) if ratio_values.numel() > 0 else 0.0,
+        }
+        if selected_idx.numel() == 0:
+            return stats
+
+        half_degree = (needle_degree / 2).unsqueeze(1)
+        new_scales = original_scales.clone()
+        new_scales[selected_idx] *= half_degree[selected_idx]
+        new_scales[selected_idx, max_idx[selected_idx]] = original_scales[selected_idx, max_idx[selected_idx]]
+        new_scales = self.scaling_inverse_activation(new_scales)
+
+        optimizable_tensors = self.replace_tensor_to_optimizer(new_scales, "scaling")
+        self._scaling = optimizable_tensors["scaling"]
+        return stats
+
+    def _densify_grad_stats(self, values, threshold):
+        finite_values = values.detach().reshape(-1)
+        finite_values = finite_values[torch.isfinite(finite_values)]
+        if finite_values.numel() == 0:
+            return {
+                "mean": 0.0,
+                "p90": 0.0,
+                "p99": 0.0,
+                "max": 0.0,
+                "over_threshold": 0,
+            }
+        return {
+            "mean": float(finite_values.mean().item()),
+            "p90": float(torch.quantile(finite_values, 0.90).item()),
+            "p99": float(torch.quantile(finite_values, 0.99).item()),
+            "max": float(finite_values.max().item()),
+            "over_threshold": int((finite_values >= threshold).sum().item()),
+        }
+
+    def _normalized_for_budget(self, values):
+        values = values.detach().reshape(-1).float()
+        values = torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        positive = values[values > 0]
+        if positive.numel() == 0:
+            return torch.zeros_like(values)
+        scale = torch.quantile(positive, 0.90).clamp_min(1e-8)
+        return (values / scale).clamp(0.0, 2.0)
+
+    def _budget_recycle_prune(self, max_total_points, max_new_points, max_grad, split_threshold,
+                              recycle_points=0, recycle_start=0.97, recycle_opacity=0.25,
+                              recycle_grad_factor=2.0):
+        stats = {
+            "budget_ratio": 0.0,
+            "budget_remaining_before": 0,
+            "budget_remaining_after": 0,
+            "recycle_target": 0,
+            "recycle_candidates": 0,
+            "recycle_pruned": 0,
+        }
+        if not max_total_points or max_total_points <= 0 or not recycle_points or recycle_points <= 0:
+            return stats
+
+        current_points = int(self.get_xyz.shape[0])
+        max_total_points = int(max_total_points)
+        remaining = max(max_total_points - current_points, 0)
+        budget_ratio = current_points / max(max_total_points, 1)
+        stats["budget_ratio"] = float(budget_ratio)
+        stats["budget_remaining_before"] = int(remaining)
+        stats["budget_remaining_after"] = int(remaining)
+        if budget_ratio < float(recycle_start):
+            return stats
+
+        reserve = int(max_new_points) if max_new_points and max_new_points > 0 else int(recycle_points)
+        target = min(int(recycle_points), max(reserve - remaining, 0), current_points)
+        stats["recycle_target"] = int(target)
+        if target <= 0:
+            return stats
+
+        grad_mean = self.xyz_gradient_accum / self.denom
+        grad_mean[grad_mean.isnan()] = 0.0
+        grad_abs = self.xyz_gradient_accum_abs / self.denom
+        grad_abs[grad_abs.isnan()] = 0.0
+        grad_score = torch.maximum(
+            grad_mean.detach().reshape(-1).abs(),
+            grad_abs.detach().reshape(-1).abs(),
+        )
+        opacity = self.get_opacity.detach().reshape(-1)
+        radii = self.max_radii2D.detach().reshape(-1).float()
+        scale = self.get_scaling.detach().max(dim=1).values
+
+        grad_limit = max(float(max_grad), float(split_threshold)) * float(recycle_grad_factor)
+        candidate_mask = torch.logical_and(opacity <= float(recycle_opacity), grad_score <= grad_limit)
+        candidate_count = int(candidate_mask.sum().item())
+        if candidate_count < target:
+            # Fall back to all non-high-gradient points if opacity alone is too conservative.
+            candidate_mask = grad_score <= grad_limit
+            candidate_count = int(candidate_mask.sum().item())
+        if candidate_count <= 0:
+            return stats
+
+        utility = (
+            0.50 * self._normalized_for_budget(opacity)
+            + 0.30 * self._normalized_for_budget(grad_score)
+            + 0.15 * self._normalized_for_budget(radii)
+            + 0.05 * self._normalized_for_budget(scale)
+        )
+        candidate_idx = torch.where(candidate_mask)[0]
+        k = min(int(target), int(candidate_idx.numel()))
+        selected_local = torch.topk(utility[candidate_idx], k=k, largest=False).indices
+        prune_mask = torch.zeros((current_points,), device=self.get_xyz.device, dtype=torch.bool)
+        prune_mask[candidate_idx[selected_local]] = True
+        pruned = int(prune_mask.sum().item())
+        if pruned > 0:
+            self.prune_points(prune_mask)
+
+        stats["recycle_candidates"] = int(candidate_count)
+        stats["recycle_pruned"] = int(pruned)
+        stats["budget_remaining_after"] = int(max(max_total_points - int(self.get_xyz.shape[0]), 0))
+        return stats
+
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, device,
+                          max_grad_abs=None, use_dual_gradient=False,
+                          use_direction_aware=False, direction_aware_base=0.8,
+                          direction_aware_scale=25.0, direction_aware_power=15.0,
+                          direction_aware_split_abs=False,
+                          density_guided_clone=False, density_guided_clone_scale=1.0,
+                          max_new_points=0, max_total_points=0, split_first=False,
+                          budget_recycle_points=0, budget_recycle_start=0.97,
+                          budget_recycle_opacity=0.25, budget_recycle_grad_factor=2.0):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        self.densify_and_clone(grads, max_grad, extent, device)
-        self.densify_and_split(grads, max_grad, extent, device)
+        grads_abs = self.xyz_gradient_accum_abs / self.denom
+        grads_abs[grads_abs.isnan()] = 0.0
+
+        consistency_stats = {
+            "consistency_mean": 0.0,
+            "consistency_p10": 0.0,
+            "consistency_p50": 0.0,
+            "direction_weight_mean": 1.0,
+            "direction_weight_p90": 1.0,
+            "direction_weight_max": 1.0,
+        }
+
+        if use_direction_aware:
+            split_threshold = max_grad_abs if max_grad_abs is not None else max_grad
+            consistency = ((grads + 1e-8) / (grads_abs + 1e-8)).clamp(0.0, 1.0)
+            direction_weight = float(direction_aware_base) + float(direction_aware_scale) * torch.pow(
+                1.0 - consistency, float(direction_aware_power)
+            )
+            clone_grads = grads / direction_weight
+            if direction_aware_split_abs:
+                split_grads = grads_abs * direction_weight
+                mode = "direction_aware_abs_split"
+            else:
+                split_grads = grads * direction_weight
+                mode = "direction_aware"
+            finite_consistency = consistency.detach().reshape(-1)
+            finite_weight = direction_weight.detach().reshape(-1)
+            finite_consistency = finite_consistency[torch.isfinite(finite_consistency)]
+            finite_weight = finite_weight[torch.isfinite(finite_weight)]
+            if finite_consistency.numel() > 0:
+                consistency_stats = {
+                    "consistency_mean": float(finite_consistency.mean().item()),
+                    "consistency_p10": float(torch.quantile(finite_consistency, 0.10).item()),
+                    "consistency_p50": float(torch.quantile(finite_consistency, 0.50).item()),
+                    "direction_weight_mean": float(finite_weight.mean().item()),
+                    "direction_weight_p90": float(torch.quantile(finite_weight, 0.90).item()),
+                    "direction_weight_max": float(finite_weight.max().item()),
+                }
+        elif use_dual_gradient:
+            split_threshold = max_grad_abs if max_grad_abs is not None else max_grad
+            clone_grads = grads
+            split_grads = grads_abs
+            mode = "dual"
+        else:
+            split_threshold = max_grad
+            clone_grads = grads_abs
+            split_grads = grads_abs
+            mode = "abs_single"
+
+        recycle_stats = self._budget_recycle_prune(
+            max_total_points,
+            max_new_points,
+            max_grad,
+            split_threshold,
+            recycle_points=budget_recycle_points,
+            recycle_start=budget_recycle_start,
+            recycle_opacity=budget_recycle_opacity,
+            recycle_grad_factor=budget_recycle_grad_factor,
+        )
+        if recycle_stats["recycle_pruned"] > 0:
+            grads = self.xyz_gradient_accum / self.denom
+            grads[grads.isnan()] = 0.0
+            grads_abs = self.xyz_gradient_accum_abs / self.denom
+            grads_abs[grads_abs.isnan()] = 0.0
+            if use_direction_aware:
+                consistency = ((grads + 1e-8) / (grads_abs + 1e-8)).clamp(0.0, 1.0)
+                direction_weight = float(direction_aware_base) + float(direction_aware_scale) * torch.pow(
+                    1.0 - consistency, float(direction_aware_power)
+                )
+                clone_grads = grads / direction_weight
+                if direction_aware_split_abs:
+                    split_grads = grads_abs * direction_weight
+                else:
+                    split_grads = grads * direction_weight
+            elif use_dual_gradient:
+                clone_grads = grads
+                split_grads = grads_abs
+            else:
+                clone_grads = grads_abs
+                split_grads = grads_abs
+
+        grad_stats = self._densify_grad_stats(clone_grads, max_grad)
+        grad_abs_stats = self._densify_grad_stats(split_grads, split_threshold)
+
+        before = int(self.get_xyz.shape[0])
+        clone_budget = int(max_new_points) if max_new_points and max_new_points > 0 else 0
+        split_budget = int(max_new_points) if max_new_points and max_new_points > 0 else 0
+        effective_split_first = bool(split_first)
+        if effective_split_first and max_total_points and max_total_points > 0:
+            effective_split_first = before / max(int(max_total_points), 1) >= float(budget_recycle_start)
+        if effective_split_first:
+            split_stats = self.densify_and_split(
+                split_grads,
+                split_threshold,
+                extent,
+                device,
+                max_new_points=split_budget,
+                max_total_points=max_total_points,
+            )
+            after_split_first = int(self.get_xyz.shape[0])
+            clone_stats = {"candidates": 0, "selected": 0, "clipped": 0}
+            after_clone = after_split_first
+            split_added = after_split_first - before
+            cloned = 0
+            after_split = after_clone
+        else:
+            clone_stats = self.densify_and_clone(
+                clone_grads,
+                max_grad,
+                extent,
+                device,
+                density_guided_clone=density_guided_clone,
+                density_guided_clone_scale=density_guided_clone_scale,
+                max_new_points=clone_budget,
+                max_total_points=max_total_points,
+            )
+            after_clone = int(self.get_xyz.shape[0])
+            split_stats = self.densify_and_split(
+                split_grads,
+                split_threshold,
+                extent,
+                device,
+                max_new_points=split_budget,
+                max_total_points=max_total_points,
+            )
+            after_split = int(self.get_xyz.shape[0])
+            cloned = after_clone - before
+            split_added = after_split - after_clone
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        pruned = int(prune_mask.sum().item())
         self.prune_points(prune_mask)
+        after_prune = int(self.get_xyz.shape[0])
 
         torch.cuda.empty_cache()
+        return {
+            "before": before,
+            "cloned": cloned,
+            "split_added": split_added,
+            "pruned": pruned,
+            "after": after_prune,
+            "mode": mode,
+            "grad_mean": grad_stats["mean"],
+            "grad_p90": grad_stats["p90"],
+            "grad_p99": grad_stats["p99"],
+            "grad_max": grad_stats["max"],
+            "grad_over_threshold": grad_stats["over_threshold"],
+            "grad_abs_mean": grad_abs_stats["mean"],
+            "grad_abs_p90": grad_abs_stats["p90"],
+            "grad_abs_p99": grad_abs_stats["p99"],
+            "grad_abs_max": grad_abs_stats["max"],
+            "grad_abs_over_threshold": grad_abs_stats["over_threshold"],
+            "grad_threshold": float(max_grad),
+            "grad_abs_threshold": float(split_threshold),
+            "density_guided_clone": bool(density_guided_clone),
+            "max_new_points": int(max_new_points) if max_new_points else 0,
+            "max_total_points": int(max_total_points) if max_total_points else 0,
+            "clone_candidates": clone_stats["candidates"],
+            "clone_selected": clone_stats["selected"],
+            "clone_clipped": clone_stats["clipped"],
+            "split_candidates": split_stats["candidates"],
+            "split_selected": split_stats["selected"],
+            "split_clipped": split_stats["clipped"],
+            "split_first": bool(effective_split_first),
+            **recycle_stats,
+            **consistency_stats,
+        }
 
-    def add_densification_stats(self, viewspace_point_tensor, update_filter, weight=1.0):
-        self.xyz_gradient_accum[update_filter] += float(weight) * torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1,
-                                                                             keepdim=True)
-        self.denom[update_filter] += float(weight)
+    def add_densification_stats(self, viewspace_point_tensor, update_filter, weight=1.0,
+                                abs_viewspace_point_tensor=None, denom_weight=None,
+                                abs_weight=None):
+        grad = torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True)
+        if abs_viewspace_point_tensor is None:
+            abs_grad = grad
+        else:
+            abs_grad = torch.norm(abs_viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True)
+        if torch.is_tensor(weight):
+            stat_weight = weight.to(grad.device, dtype=grad.dtype).reshape(-1, 1)
+        else:
+            stat_weight = float(weight)
+        if denom_weight is None:
+            denom_stat_weight = stat_weight
+        elif torch.is_tensor(denom_weight):
+            denom_stat_weight = denom_weight.to(grad.device, dtype=grad.dtype).reshape(-1, 1)
+        else:
+            denom_stat_weight = float(denom_weight)
+        if abs_weight is None:
+            abs_stat_weight = stat_weight
+        elif torch.is_tensor(abs_weight):
+            abs_stat_weight = abs_weight.to(grad.device, dtype=grad.dtype).reshape(-1, 1)
+        else:
+            abs_stat_weight = float(abs_weight)
+        self.xyz_gradient_accum[update_filter] += stat_weight * grad
+        self.xyz_gradient_accum_abs[update_filter] += abs_stat_weight * abs_grad
+        self.denom[update_filter] += denom_stat_weight
 
     def adjust_scaling(self, scale_factor):
         self._scaling /= scale_factor
