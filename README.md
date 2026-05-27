@@ -148,8 +148,8 @@ We thank the authors of the following thermal 3D Gaussian Splatting works for th
 ```bibtex
 @inproceedings{gao2026physirsplat,
   title={PhysIR-Splat: Physically Consistent Thermal Infrared Radiative Transfer in 3D Gaussian Splatting},
-  author={Gao, Jingyuan and Hu, Yumeng and Gao, Fei and Zhang, Mingjin},
-  booktitle={CVPR},
+  author={Gao, Jingyuan and Zhang, Qiming and Gao, Fei and Zhang, Mingjin},
+  booktitle={IEEE/CVF Conference on Computer Vision and Pattern Recognition},
   year={2026}
 }
 ```
