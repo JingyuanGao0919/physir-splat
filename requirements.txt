@@ -1,0 +1,6 @@
+numpy==1.21.6
+Pillow==9.5.0
+plyfile==0.9
+scipy==1.7.3
+lpips==0.1.4
+tqdm==4.67.1
